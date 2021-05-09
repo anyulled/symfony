@@ -1,0 +1,802 @@
+<?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\DependencyInjection\Tests\Compiler;
+
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\Config\FileLocator;
+use Symfony\Component\DependencyInjection\Alias;
+use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
+use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
+use Symfony\Component\DependencyInjection\ChildDefinition;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Loader\YamlFileLoader;
+use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\DependencyInjection\ServiceLocator;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\Attribute\CustomAutoconfiguration;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\BarTagClass;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\FooBarTaggedClass;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\FooBarTaggedForDefaultPriorityClass;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\FooTagClass;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\IteratorConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\LocatorConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\LocatorConsumerConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\LocatorConsumerFactory;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\TaggedService1;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\TaggedService2;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\TaggedService3;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\TaggedService3Configurator;
+use Symfony\Contracts\Service\ServiceProviderInterface;
+use Symfony\Contracts\Service\ServiceSubscriberInterface;
+
+/**
+ * This class tests the integration of the different compiler passes.
+ */
+class IntegrationTest extends TestCase
+{
+    /**
+     * This tests that dependencies are correctly processed.
+     *
+     * We're checking that:
+     *
+     *   * A is public, B/C are private
+     *   * A -> C
+     *   * B -> C
+     */
+    public function testProcessRemovesAndInlinesRecursively()
+    {
+        $container = new ContainerBuilder();
+        $container->setResourceTracking(false);
+
+        $a = $container
+            ->register('a', '\stdClass')
+            ->addArgument(new Reference('c'))
+            ->setPublic(true)
+        ;
+
+        $container
+            ->register('b', '\stdClass')
+            ->addArgument(new Reference('c'))
+        ;
+
+        $c = $container
+            ->register('c', '\stdClass')
+        ;
+
+        $container->compile();
+
+        $this->assertTrue($container->hasDefinition('a'));
+        $arguments = $a->getArguments();
+        $this->assertSame($c, $arguments[0]);
+        $this->assertFalse($container->hasDefinition('b'));
+        $this->assertFalse($container->hasDefinition('c'));
+    }
+
+    public function testProcessInlinesReferencesToAliases()
+    {
+        $container = new ContainerBuilder();
+        $container->setResourceTracking(false);
+
+        $a = $container
+            ->register('a', '\stdClass')
+            ->addArgument(new Reference('b'))
+            ->setPublic(true)
+        ;
+
+        $container->setAlias('b', new Alias('c', false));
+
+        $c = $container
+            ->register('c', '\stdClass')
+        ;
+
+        $container->compile();
+
+        $this->assertTrue($container->hasDefinition('a'));
+        $arguments = $a->getArguments();
+        $this->assertSame($c, $arguments[0]);
+        $this->assertFalse($container->hasAlias('b'));
+        $this->assertFalse($container->hasDefinition('c'));
+    }
+
+    public function testProcessInlinesWhenThereAreMultipleReferencesButFromTheSameDefinition()
+    {
+        $container = new ContainerBuilder();
+        $container->setResourceTracking(false);
+
+        $container
+            ->register('a', '\stdClass')
+            ->addArgument(new Reference('b'))
+            ->addMethodCall('setC', [new Reference('c')])
+            ->setPublic(true)
+        ;
+
+        $container
+            ->register('b', '\stdClass')
+            ->addArgument(new Reference('c'))
+        ;
+
+        $container
+            ->register('c', '\stdClass')
+        ;
+
+        $container->compile();
+
+        $this->assertTrue($container->hasDefinition('a'));
+        $this->assertFalse($container->hasDefinition('b'));
+        $this->assertFalse($container->hasDefinition('c'), 'Service C was not inlined.');
+    }
+
+    public function testCanDecorateServiceSubscriber()
+    {
+        $container = new ContainerBuilder();
+        $container->register(ServiceSubscriberStub::class)
+            ->addTag('container.service_subscriber')
+            ->setPublic(true);
+
+        $container->register(DecoratedServiceSubscriber::class)
+            ->setDecoratedService(ServiceSubscriberStub::class);
+
+        $container->compile();
+
+        $this->assertInstanceOf(DecoratedServiceSubscriber::class, $container->get(ServiceSubscriberStub::class));
+    }
+
+    public function testCanDecorateServiceLocator()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register('foo', 'stdClass')->setPublic(true);
+
+        $container->register(ServiceLocator::class)
+            ->addTag('container.service_locator')
+            ->setArguments([[new Reference('foo')]])
+        ;
+
+        $container->register(DecoratedServiceLocator::class)
+            ->setDecoratedService(ServiceLocator::class)
+            ->setPublic(true)
+            ->setArguments([new Reference(DecoratedServiceLocator::class.'.inner')])
+        ;
+
+        $container->compile();
+
+        $this->assertInstanceOf(DecoratedServiceLocator::class, $container->get(DecoratedServiceLocator::class));
+        $this->assertSame($container->get('foo'), $container->get(DecoratedServiceLocator::class)->get('foo'));
+    }
+
+    /**
+     * @dataProvider getYamlCompileTests
+     */
+    public function testYamlContainerCompiles($directory, $actualServiceId, $expectedServiceId, ContainerBuilder $mainContainer = null)
+    {
+        // allow a container to be passed in, which might have autoconfigure settings
+        $container = $mainContainer ?? new ContainerBuilder();
+        $container->setResourceTracking(false);
+        $loader = new YamlFileLoader($container, new FileLocator(__DIR__.'/../Fixtures/yaml/integration/'.$directory));
+        $loader->load('main.yml');
+        $container->compile();
+        $actualService = $container->getDefinition($actualServiceId);
+
+        // create a fresh ContainerBuilder, to avoid autoconfigure stuff
+        $container = new ContainerBuilder();
+        $container->setResourceTracking(false);
+        $loader = new YamlFileLoader($container, new FileLocator(__DIR__.'/../Fixtures/yaml/integration/'.$directory));
+        $loader->load('expected.yml');
+        $container->compile();
+        $expectedService = $container->getDefinition($expectedServiceId);
+
+        // reset changes, we don't care if these differ
+        $actualService->setChanges([]);
+        $expectedService->setChanges([]);
+
+        $this->assertEquals($expectedService, $actualService);
+    }
+
+    public function getYamlCompileTests()
+    {
+        $container = new ContainerBuilder();
+        $container->registerForAutoconfiguration(IntegrationTestStub::class);
+        yield [
+            'autoconfigure_child_not_applied',
+            'child_service',
+            'child_service_expected',
+            $container,
+        ];
+
+        $container = new ContainerBuilder();
+        $container->registerForAutoconfiguration(IntegrationTestStub::class);
+        yield [
+            'autoconfigure_parent_child',
+            'child_service',
+            'child_service_expected',
+            $container,
+        ];
+
+        $container = new ContainerBuilder();
+        $container->registerForAutoconfiguration(IntegrationTestStub::class)
+            ->addTag('from_autoconfigure');
+        yield [
+            'autoconfigure_parent_child_tags',
+            'child_service',
+            'child_service_expected',
+            $container,
+        ];
+
+        yield [
+            'child_parent',
+            'child_service',
+            'child_service_expected',
+        ];
+
+        yield [
+            'defaults_child_tags',
+            'child_service',
+            'child_service_expected',
+        ];
+
+        yield [
+            'defaults_instanceof_importance',
+            'main_service',
+            'main_service_expected',
+        ];
+
+        yield [
+            'defaults_parent_child',
+            'child_service',
+            'child_service_expected',
+        ];
+
+        yield [
+            'instanceof_parent_child',
+            'child_service',
+            'child_service_expected',
+        ];
+
+        $container = new ContainerBuilder();
+        $container->registerForAutoconfiguration(IntegrationTestStub::class)
+            ->addMethodCall('setSunshine', ['supernova']);
+        yield [
+            'instanceof_and_calls',
+            'main_service',
+            'main_service_expected',
+            $container,
+        ];
+    }
+
+    public function testTaggedServiceWithIndexAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar'])
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register(FooBarTaggedClass::class)
+            ->addArgument(new TaggedIteratorArgument('foo_bar', 'foo'))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get(FooBarTaggedClass::class);
+
+        $param = iterator_to_array($s->getParam()->getIterator());
+        $this->assertSame(['bar' => $container->get(BarTagClass::class), 'foo_tag_class' => $container->get(FooTagClass::class)], $param);
+    }
+
+    public function testTaggedServiceWithIndexAttributeAndDefaultMethod()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register(FooBarTaggedClass::class)
+            ->addArgument(new TaggedIteratorArgument('foo_bar', 'foo', 'getFooBar'))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get(FooBarTaggedClass::class);
+
+        $param = iterator_to_array($s->getParam()->getIterator());
+        $this->assertSame(['bar_tab_class_with_defaultmethod' => $container->get(BarTagClass::class), 'foo' => $container->get(FooTagClass::class)], $param);
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testTaggedServiceWithIndexAttributeAndDefaultMethodConfiguredViaAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar_tab_class_with_defaultmethod'])
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register(IteratorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get(IteratorConsumer::class);
+
+        $param = iterator_to_array($s->getParam()->getIterator());
+        $this->assertSame(['bar_tab_class_with_defaultmethod' => $container->get(BarTagClass::class), 'foo' => $container->get(FooTagClass::class)], $param);
+    }
+
+    public function testTaggedIteratorWithMultipleIndexAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar'])
+            ->addTag('foo_bar', ['foo' => 'bar_duplicate'])
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+            ->addTag('foo_bar')
+        ;
+        $container->register(FooBarTaggedClass::class)
+            ->addArgument(new TaggedIteratorArgument('foo_bar', 'foo'))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get(FooBarTaggedClass::class);
+
+        $param = iterator_to_array($s->getParam()->getIterator());
+        $this->assertSame(['bar' => $container->get(BarTagClass::class), 'bar_duplicate' => $container->get(BarTagClass::class), 'foo_tag_class' => $container->get(FooTagClass::class)], $param);
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testTaggedLocatorConfiguredViaAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar_tab_class_with_defaultmethod'])
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register(LocatorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        /** @var LocatorConsumer $s */
+        $s = $container->get(LocatorConsumer::class);
+
+        $locator = $s->getLocator();
+        self::assertSame($container->get(BarTagClass::class), $locator->get('bar_tab_class_with_defaultmethod'));
+        self::assertSame($container->get(FooTagClass::class), $locator->get('foo'));
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testNestedDefinitionWithAutoconfiguredConstructorArgument()
+    {
+        $container = new ContainerBuilder();
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register(LocatorConsumerConsumer::class)
+            ->setPublic(true)
+            ->setArguments([
+                (new Definition(LocatorConsumer::class))
+                    ->setAutowired(true),
+            ])
+        ;
+
+        $container->compile();
+
+        /** @var LocatorConsumerConsumer $s */
+        $s = $container->get(LocatorConsumerConsumer::class);
+
+        $locator = $s->getLocatorConsumer()->getLocator();
+        self::assertSame($container->get(FooTagClass::class), $locator->get('foo'));
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testFactoryWithAutoconfiguredArgument()
+    {
+        $container = new ContainerBuilder();
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['key' => 'my_service'])
+        ;
+        $container->register(LocatorConsumerFactory::class);
+        $container->register(LocatorConsumer::class)
+            ->setPublic(true)
+            ->setAutowired(true)
+            ->setFactory(new Reference(LocatorConsumerFactory::class))
+        ;
+
+        $container->compile();
+
+        /** @var LocatorConsumer $s */
+        $s = $container->get(LocatorConsumer::class);
+
+        $locator = $s->getLocator();
+        self::assertSame($container->get(FooTagClass::class), $locator->get('my_service'));
+    }
+
+    public function testTaggedServiceWithDefaultPriorityMethod()
+    {
+        $container = new ContainerBuilder();
+        $container->register(BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register(FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register(FooBarTaggedForDefaultPriorityClass::class)
+            ->addArgument(new TaggedIteratorArgument('foo_bar', null, null, false, 'getPriority'))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get(FooBarTaggedForDefaultPriorityClass::class);
+
+        $param = iterator_to_array($s->getParam()->getIterator());
+        $this->assertSame([$container->get(FooTagClass::class), $container->get(BarTagClass::class)], $param);
+    }
+
+    public function testTaggedServiceLocatorWithIndexAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar_tag', BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar'])
+        ;
+        $container->register('foo_tag', FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register('foo_bar_tagged', FooBarTaggedClass::class)
+            ->addArgument(new ServiceLocatorArgument(new TaggedIteratorArgument('foo_bar', 'foo', null, true)))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get('foo_bar_tagged');
+
+        /** @var ServiceLocator $serviceLocator */
+        $serviceLocator = $s->getParam();
+        $this->assertTrue($s->getParam() instanceof ServiceLocator, sprintf('Wrong instance, should be an instance of ServiceLocator, %s given', get_debug_type($serviceLocator)));
+
+        $same = [
+            'bar' => $serviceLocator->get('bar'),
+            'foo_tag_class' => $serviceLocator->get('foo_tag_class'),
+        ];
+        $this->assertSame(['bar' => $container->get('bar_tag'), 'foo_tag_class' => $container->get('foo_tag')], $same);
+    }
+
+    public function testTaggedServiceLocatorWithMultipleIndexAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar_tag', BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'bar'])
+            ->addTag('foo_bar', ['foo' => 'bar_duplicate'])
+        ;
+        $container->register('foo_tag', FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+            ->addTag('foo_bar')
+        ;
+        $container->register('foo_bar_tagged', FooBarTaggedClass::class)
+            ->addArgument(new ServiceLocatorArgument(new TaggedIteratorArgument('foo_bar', 'foo', null, true)))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get('foo_bar_tagged');
+
+        /** @var ServiceLocator $serviceLocator */
+        $serviceLocator = $s->getParam();
+        $this->assertTrue($s->getParam() instanceof ServiceLocator, sprintf('Wrong instance, should be an instance of ServiceLocator, %s given', get_debug_type($serviceLocator)));
+
+        $same = [
+            'bar' => $serviceLocator->get('bar'),
+            'bar_duplicate' => $serviceLocator->get('bar_duplicate'),
+            'foo_tag_class' => $serviceLocator->get('foo_tag_class'),
+        ];
+        $this->assertSame(['bar' => $container->get('bar_tag'), 'bar_duplicate' => $container->get('bar_tag'), 'foo_tag_class' => $container->get('foo_tag')], $same);
+    }
+
+    public function testTaggedServiceLocatorWithIndexAttributeAndDefaultMethod()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar_tag', BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register('foo_tag', FooTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar', ['foo' => 'foo'])
+        ;
+        $container->register('foo_bar_tagged', FooBarTaggedClass::class)
+            ->addArgument(new ServiceLocatorArgument(new TaggedIteratorArgument('foo_bar', 'foo', 'getFooBar', true)))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get('foo_bar_tagged');
+
+        /** @var ServiceLocator $serviceLocator */
+        $serviceLocator = $s->getParam();
+        $this->assertTrue($s->getParam() instanceof ServiceLocator, sprintf('Wrong instance, should be an instance of ServiceLocator, %s given', get_debug_type($serviceLocator)));
+
+        $same = [
+            'bar_tab_class_with_defaultmethod' => $serviceLocator->get('bar_tab_class_with_defaultmethod'),
+            'foo' => $serviceLocator->get('foo'),
+        ];
+        $this->assertSame(['bar_tab_class_with_defaultmethod' => $container->get('bar_tag'), 'foo' => $container->get('foo_tag')], $same);
+    }
+
+    public function testTaggedServiceLocatorWithFallback()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar_tag', BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('foo_bar')
+        ;
+        $container->register('foo_bar_tagged', FooBarTaggedClass::class)
+            ->addArgument(new ServiceLocatorArgument(new TaggedIteratorArgument('foo_bar', null, null, true)))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get('foo_bar_tagged');
+
+        /** @var ServiceLocator $serviceLocator */
+        $serviceLocator = $s->getParam();
+        $this->assertTrue($s->getParam() instanceof ServiceLocator, sprintf('Wrong instance, should be an instance of ServiceLocator, %s given', get_debug_type($serviceLocator)));
+
+        $expected = [
+            'bar_tag' => $container->get('bar_tag'),
+        ];
+        $this->assertSame($expected, ['bar_tag' => $serviceLocator->get('bar_tag')]);
+    }
+
+    public function testTaggedServiceLocatorWithDefaultIndex()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar_tag', BarTagClass::class)
+            ->setPublic(true)
+            ->addTag('app.foo_bar', ['foo_bar' => 'baz'])
+        ;
+        $container->register('foo_bar_tagged', FooBarTaggedClass::class)
+            ->addArgument(new ServiceLocatorArgument(new TaggedIteratorArgument('app.foo_bar', null, null, true)))
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $s = $container->get('foo_bar_tagged');
+
+        /** @var ServiceLocator $serviceLocator */
+        $serviceLocator = $s->getParam();
+        $this->assertTrue($s->getParam() instanceof ServiceLocator, sprintf('Wrong instance, should be an instance of ServiceLocator, %s given', get_debug_type($serviceLocator)));
+
+        $expected = [
+            'baz' => $container->get('bar_tag'),
+        ];
+        $this->assertSame($expected, ['baz' => $serviceLocator->get('baz')]);
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testTagsViaAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->registerAttributeForAutoconfiguration(
+            CustomAutoconfiguration::class,
+            static function (ChildDefinition $definition, CustomAutoconfiguration $attribute, \ReflectionClass $reflector) {
+                $definition->addTag('app.custom_tag', get_object_vars($attribute) + ['class' => $reflector->getName()]);
+            }
+        );
+
+        $container->register('one', TaggedService1::class)
+            ->setPublic(true)
+            ->setAutoconfigured(true);
+        $container->register('two', TaggedService2::class)
+            ->addTag('app.custom_tag', ['info' => 'This tag is not autoconfigured'])
+            ->setPublic(true)
+            ->setAutoconfigured(true);
+
+        $collector = new TagCollector();
+        $container->addCompilerPass($collector);
+
+        $container->compile();
+
+        self::assertSame([
+            'one' => [
+                ['someAttribute' => 'one', 'priority' => 0, 'class' => TaggedService1::class],
+                ['someAttribute' => 'two', 'priority' => 0, 'class' => TaggedService1::class],
+            ],
+            'two' => [
+                ['info' => 'This tag is not autoconfigured'],
+                ['someAttribute' => 'prio 100', 'priority' => 100, 'class' => TaggedService2::class],
+            ],
+        ], $collector->collectedTags);
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testAttributesAreIgnored()
+    {
+        $container = new ContainerBuilder();
+        $container->registerAttributeForAutoconfiguration(
+            CustomAutoconfiguration::class,
+            static function (Definition $definition, CustomAutoconfiguration $attribute) {
+                $definition->addTag('app.custom_tag', get_object_vars($attribute));
+            }
+        );
+
+        $container->register('one', TaggedService1::class)
+            ->setPublic(true)
+            ->addTag('container.ignore_attributes')
+            ->setAutoconfigured(true);
+        $container->register('two', TaggedService2::class)
+            ->setPublic(true)
+            ->setAutoconfigured(true);
+
+        $collector = new TagCollector();
+        $container->addCompilerPass($collector);
+
+        $container->compile();
+
+        self::assertSame([
+            'two' => [
+                ['someAttribute' => 'prio 100', 'priority' => 100],
+            ],
+        ], $collector->collectedTags);
+    }
+
+    /**
+     * @requires PHP 8
+     */
+    public function testAutoconfigureViaAttribute()
+    {
+        $container = new ContainerBuilder();
+        $container->registerAttributeForAutoconfiguration(
+            CustomAutoconfiguration::class,
+            static function (ChildDefinition $definition) {
+                $definition
+                    ->addMethodCall('doSomething', [1, 2, 3])
+                    ->setBindings(['string $foo' => 'bar'])
+                    ->setConfigurator(new Reference('my_configurator'))
+                ;
+            }
+        );
+
+        $container->register('my_configurator', TaggedService3Configurator::class);
+        $container->register('three', TaggedService3::class)
+            ->setPublic(true)
+            ->setAutoconfigured(true);
+
+        $container->compile();
+
+        /** @var TaggedService3 $service */
+        $service = $container->get('three');
+
+        self::assertSame('bar', $service->foo);
+        self::assertSame(6, $service->sum);
+        self::assertTrue($service->hasBeenConfigured);
+    }
+}
+
+class ServiceSubscriberStub implements ServiceSubscriberInterface
+{
+    public static function getSubscribedServices(): array
+    {
+        return [];
+    }
+}
+
+class DecoratedServiceSubscriber
+{
+}
+
+class DecoratedServiceLocator implements ServiceProviderInterface
+{
+    /**
+     * @var ServiceLocator
+     */
+    private $locator;
+
+    public function __construct(ServiceLocator $locator)
+    {
+        $this->locator = $locator;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function get($id)
+    {
+        return $this->locator->get($id);
+    }
+
+    public function has($id): bool
+    {
+        return $this->locator->has($id);
+    }
+
+    public function getProvidedServices(): array
+    {
+        return $this->locator->getProvidedServices();
+    }
+}
+
+class IntegrationTestStub extends IntegrationTestStubParent
+{
+}
+
+class IntegrationTestStubParent
+{
+    public function enableSummer($enable)
+    {
+        // methods used in calls - added here to prevent errors for not existing
+    }
+
+    public function setSunshine($type)
+    {
+    }
+}
+
+final class TagCollector implements CompilerPassInterface
+{
+    public $collectedTags;
+
+    public function process(ContainerBuilder $container): void
+    {
+        $this->collectedTags = $container->findTaggedServiceIds('app.custom_tag');
+    }
+}
